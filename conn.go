@@ -35,6 +35,13 @@ type ConnConfig struct {
 	// "cache_describe" query exec mode.
 	DescriptionCacheCapacity int
 
+	// StatementUsageThreshold is the number of times a statement must be used before it is prepared and cached.
+	// If set to 0, statements are never prepared and cached.
+	// If set to 1, statements are prepared and cached on first use.
+	// If set to a value greater than 1, statements are only prepared and cached after being used that many times.
+	// Default is 2, meaning statements are prepared and cached after being used twice (on the second execution).
+	StatementUsageThreshold int
+
 	// DefaultQueryExecMode controls the default mode for executing queries. By default pgx uses the extended protocol
 	// and automatically prepares and caches prepared statements. However, this may be incompatible with proxies such as
 	// PGBouncer. In this case it may be preferable to use QueryExecModeExec or QueryExecModeSimpleProtocol. The same
@@ -70,6 +77,7 @@ type Conn struct {
 	preparedStatements map[string]*pgconn.StatementDescription
 	statementCache     stmtcache.Cache
 	descriptionCache   stmtcache.Cache
+	queryUsageCounts   map[string]int // tracks how many times each query has been used
 
 	queryTracer    QueryTracer
 	batchTracer    BatchTracer
@@ -187,6 +195,16 @@ func ParseConfigWithOptions(connString string, options ParseConfigOptions) (*Con
 		descriptionCacheCapacity = int(n)
 	}
 
+	statementUsageThreshold := 2
+	if s, ok := config.RuntimeParams["statement_usage_threshold"]; ok {
+		delete(config.RuntimeParams, "statement_usage_threshold")
+		n, err := strconv.ParseInt(s, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("cannot parse statement_usage_threshold: %w", err)
+		}
+		statementUsageThreshold = int(n)
+	}
+
 	defaultQueryExecMode := QueryExecModeCacheStatement
 	if s, ok := config.RuntimeParams["default_query_exec_mode"]; ok {
 		delete(config.RuntimeParams, "default_query_exec_mode")
@@ -211,6 +229,7 @@ func ParseConfigWithOptions(connString string, options ParseConfigOptions) (*Con
 		createdByParseConfig:     true,
 		StatementCacheCapacity:   statementCacheCapacity,
 		DescriptionCacheCapacity: descriptionCacheCapacity,
+		StatementUsageThreshold:  statementUsageThreshold,
 		DefaultQueryExecMode:     defaultQueryExecMode,
 		connString:               connString,
 	}
@@ -232,6 +251,12 @@ func ParseConfigWithOptions(connString string, options ParseConfigOptions) (*Con
 //   - description_cache_capacity.
 //     The maximum size of the description cache used when executing a query with "cache_describe" query exec mode.
 //     Default: 512.
+//
+//   - statement_usage_threshold.
+//     The number of times a statement must be used before it is prepared and cached.
+//     If set to 0 or 1, statements are prepared and cached on first use (default behavior).
+//     If set to a value greater than 1, statements are only prepared and cached after being used that many times.
+//     Default: 1.
 func ParseConfig(connString string) (*ConnConfig, error) {
 	return ParseConfigWithOptions(connString, ParseConfigOptions{})
 }
@@ -252,9 +277,10 @@ func connect(ctx context.Context, config *ConnConfig) (c *Conn, err error) {
 	}
 
 	c = &Conn{
-		config:      config,
-		typeMap:     pgtype.NewMap(),
-		queryTracer: config.Tracer,
+		config:           config,
+		typeMap:          pgtype.NewMap(),
+		queryTracer:      config.Tracer,
+		queryUsageCounts: make(map[string]int),
 	}
 
 	if t, ok := c.queryTracer.(BatchTracer); ok {
@@ -781,6 +807,7 @@ optionLoop:
 
 	var err error
 	sd, explicitPreparedStatement := c.preparedStatements[sql]
+
 	if sd != nil || mode == QueryExecModeCacheStatement || mode == QueryExecModeCacheDescribe || mode == QueryExecModeDescribeExec {
 		if sd == nil {
 			sd, err = c.getStatementDescription(ctx, mode, sql)
@@ -873,11 +900,33 @@ func (c *Conn) getStatementDescription(
 		}
 		sd = c.statementCache.Get(sql)
 		if sd == nil {
-			sd, err = c.Prepare(ctx, stmtcache.StatementName(sql), sql)
-			if err != nil {
-				return nil, err
+			// Increment usage count for this query
+			if c.queryUsageCounts == nil {
+				c.queryUsageCounts = make(map[string]int)
 			}
-			c.statementCache.Put(sd)
+			c.queryUsageCounts[sql]++
+
+			// Only prepare and cache if it has been used enough times
+			threshold := c.config.StatementUsageThreshold
+			if threshold == 0 {
+				// Never prepare and cache if threshold is 0
+				sd, err = c.Prepare(ctx, "", sql)
+				if err != nil {
+					return nil, err
+				}
+			} else if threshold == 1 || c.queryUsageCounts[sql] >= threshold {
+				sd, err = c.Prepare(ctx, stmtcache.StatementName(sql), sql)
+				if err != nil {
+					return nil, err
+				}
+				c.statementCache.Put(sd)
+			} else {
+				// For queries that haven't reached the threshold, use unnamed prepared statements
+				sd, err = c.Prepare(ctx, "", sql)
+				if err != nil {
+					return nil, err
+				}
+			}
 		}
 	case QueryExecModeCacheDescribe:
 		if c.descriptionCache == nil {
@@ -1431,6 +1480,7 @@ func (c *Conn) deallocateInvalidatedCachedStatements(ctx context.Context) error 
 	c.statementCache.RemoveInvalidated()
 	for _, sd := range invalidatedStatements {
 		delete(c.preparedStatements, sd.Name)
+		delete(c.queryUsageCounts, sd.SQL)
 	}
 
 	return nil
